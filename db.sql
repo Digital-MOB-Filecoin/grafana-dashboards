@@ -1,63 +1,49 @@
--- most table structure is copied over from lily, as well as indexes and panel queries
-CREATE TABLE public.actors (
-    height     bigint NOT NULL,
-    id         text NOT NULL,
-    state_root text NOT NULL,
-    code       text NOT NULL,
-    head       text NOT NULL,
-    balance    numeric NOT NULL,
-    nonce      bigint NOT NULL,
-    state      jsonb,
-    code_cid   text
+-- will have and endpoint with this info, on network version change, wipe actor_types and actor_methods and repopulate
+-- in actor_codes we only append
+CREATE TABLE public.actor_types (
+    actor_type_id integer
+    actor_id integer -- populated only for singleton builtin actors
+    actor_code_cid bytea
 );
-ALTER TABLE ONLY public.actors ADD CONSTRAINT actors_pkey PRIMARY KEY (height, id, state_root);
-CREATE INDEX actors_height_idx ON public.actors USING btree (height DESC);
-SELECT create_hypertable('actors', 'height', chunk_time_interval => 20160, if_not_exists => TRUE);
-SELECT set_integer_now_func('actors', 'current_height', replace_if_exists => true);
+
+CREATE TABLE public.actor_codes (
+    actor_type_id    integer
+    actor_code_cid bytea
+    network_version integer
+);
 
 CREATE TABLE public.actor_methods (
-    actor_family      text   NOT NULL,
+    actor_type_id    integer
     method_name text   NOT NULL,
     method      bigint NOT NULL,
-    PRIMARY KEY (family, method)
+    FOREIGN KEY (actor_type_id) REFERENCES actor_types (actor_type_id),
 );
 
 -- all fields can be extracted from ChainGetTipSet
 CREATE TABLE public.block_headers (
     height            bigint NOT NULL,
-    cid               text   NOT NULL, 
-    miner_id          text   NOT NULL,
+    cid               bytea   NOT NULL, 
+    miner_id          integer   NOT NULL,
     parent_weight     numeric NOT NULL,
     parent_base_fee   numeric NOT NULL,
-    parent_state_root text   NOT NULL,
+    parent_state_root bytea   NOT NULL,
     timestamp         bigint NOT NULL,
     win_count         bigint,
     fork_signaling    bigint NOT NULL
 );
 
-ALTER TABLE ONLY public.block_headers ADD CONSTRAINT block_headers_pkey PRIMARY KEY (height, cid);
-CREATE INDEX block_headers_height_idx    ON public.block_headers USING btree (height DESC);
-CREATE INDEX block_headers_timestamp_idx ON public.block_headers USING btree (timestamp);
-SELECT create_hypertable('block_headers', 'height', chunk_time_interval => 20160, if_not_exists => TRUE);
-SELECT set_integer_now_func('block_headers', 'current_height', replace_if_exists => true);
+-- some fields can be extracted from StateVMCirculatingSupplyInternal
+-- the rest are fetched from power actor state
 
--- all fields, except parent_state_root can be extracted from StateVMCirculatingSupplyInternal
 CREATE TABLE public.chain_economics (
     height                bigint  NOT NULL,
-    parent_state_root     text    NOT NULL,
+    state_root            bytea   NOT NULL,
     circulating_fil       numeric NOT NULL,
     vested_fil            numeric NOT NULL,
     mined_fil             numeric NOT NULL,
     burnt_fil             numeric NOT NULL,
     locked_fil            numeric NOT NULL,
     fil_reserve_disbursed numeric NOT NULL
-);
-ALTER TABLE ONLY public.chain_economics ADD CONSTRAINT chain_economics_pk PRIMARY KEY (height, parent_state_root);
-
--- all fetched from power actor state
-CREATE TABLE public.chain_powers (
-    height                        bigint  NOT NULL,
-    state_root                    text    NOT NULL,
     total_raw_bytes_power         numeric NOT NULL,
     total_raw_bytes_committed     numeric NOT NULL,
     total_qa_bytes_power          numeric NOT NULL,
@@ -67,9 +53,8 @@ CREATE TABLE public.chain_powers (
     qa_smoothed_velocity_estimate numeric NOT NULL,
     miner_count                   bigint,
     participating_miner_count     bigint
+
 );
-ALTER TABLE ONLY public.chain_powers ADD CONSTRAINT chain_powers_pkey PRIMARY KEY (height, state_root);
-CREATE INDEX chain_powers_height_idx ON public.chain_powers USING btree (height DESC);
 
 -- you need to call ChainGetParentReceipts and ChainGetParentMessages
 -- from receipt you get gas_used and exit_code, you also get return but that doesn't seem to be needed
@@ -85,16 +70,21 @@ CREATE INDEX chain_powers_height_idx ON public.chain_powers USING btree (height 
 -- miner_tip = min(gasPremium, feeCap - baseFeeToPay) * gasLimit
 -- refund = (gasLimit * feeCap) - base_fee_burn - miner_tip - over_estimation_burn
 -- gas_refund = (gasLimit - gasUsed) - gasToBurn 
--- gas_burned = (gasLimit - gasUsed) * over / gasUsed, if gasUsed = 0, gas_burned = gasLimit
 
--- postgres virtual column -> investigate
+-- over := gasLimit - (11*gasUsed)/10   // gasLimit/gasUsed - 1 - 0.1, scaled
+-- if over < 0 { return gasLimit-gasUsed, 0 }  // no burn if overuse < 10%
+-- if over > gasUsed { over = gasUsed }         // cap at 100%
+-- gasToBurn = (gasLimit - gasUsed) * over / gasUsed
+
+-- gas_burned = (gasLimit - gasUsed) * over / gasUsed, if gasUsed = 0, gas_burned = gasLimit
+-- baseFeeToPay = min(baseFee, feeCap).
+-- postgres virtual column -> available from postgres 18
 
 CREATE TABLE public.derived_gas_outputs (
-    msg_internal_id      bigint NOT NULL GENERATED ALWAYS AS IDENTITY,
     height               bigint  NOT NULL,
     index_in_block       int,
-    cid                  text    NOT NULL,
-    state_root           text    NOT NULL,
+    cid                  bytea   NOT NULL,
+    state_root           bytea   NOT NULL,
     "from"               text    NOT NULL,
     "to"                 text    NOT NULL,
     value                numeric NOT NULL,
@@ -107,25 +97,16 @@ CREATE TABLE public.derived_gas_outputs (
     exit_code            bigint  NOT NULL,
     gas_used             bigint  NOT NULL,
     parent_base_fee      numeric NOT NULL,
-    base_fee_burn        numeric NOT NULL,
-    over_estimation_burn numeric NOT NULL,
-    miner_penalty        numeric NOT NULL,
-    miner_tip            numeric NOT NULL,
-    refund               numeric NOT NULL,
-    gas_refund           bigint  NOT NULL,
-    gas_burned           bigint  NOT NULL,
-    actor_name           text    NOT NULL,
-    actor_family         text    NOT NULL,
+    base_fee_burn        numeric GENERATED ALWAYS AS (min(parent_base_fee, gas_fee_cap)*gas_used),
+    over_estimation_burn numeric GENERATED ALWAYS AS (min(parent_base_fee, gas_fee_cap)*gas_burned),
+    miner_penalty        numeric NOT NULL, --conditional formula
+    miner_tip            numeric GENERATED ALWAYS AS (min(gas_premium, gas_fee_cap - min(parent_base_fee, gas_fee_cap)) * gas_limit),
+    refund               numeric GENERATED ALWAYS AS (gas_limit * gas_fee_cap) - base_fee_burn - miner_tip - over_estimation_burn,
+    gas_refund           bigint  NOT NULL, -- (gasLimit - gasUsed) - gasToBurn gasToBurn has a conditional formula
+    gas_burned           bigint  NOT NULL, --conditional formula
+    actor_type_id        integer    NOT NULL,
     params               text    NOT NULL
 );
-ALTER TABLE ONLY public.derived_gas_outputs ADD CONSTRAINT derived_gas_outputs_pkey PRIMARY KEY (height, cid, state_root);
-CREATE INDEX derived_gas_outputs_exit_code_index    ON public.derived_gas_outputs USING btree (exit_code);
-CREATE INDEX derived_gas_outputs_from_index         ON public.derived_gas_outputs USING hash  ("from");
-CREATE INDEX derived_gas_outputs_method_index       ON public.derived_gas_outputs USING btree (method);
-CREATE INDEX derived_gas_outputs_to_index           ON public.derived_gas_outputs USING hash  ("to");
-CREATE INDEX derived_gas_outputs_actor_family_index ON public.derived_gas_outputs USING btree (actor_family);
-SELECT create_hypertable('derived_gas_outputs', 'height', chunk_time_interval => 20160, if_not_exists => TRUE);
-SELECT set_integer_now_func('derived_gas_outputs', 'current_height', replace_if_exists => true);
 
 CREATE TYPE public.miner_sector_event_type AS ENUM (
     'PRECOMMIT_ADDED',
@@ -140,52 +121,31 @@ CREATE TYPE public.miner_sector_event_type AS ENUM (
     'SECTOR_TERMINATED'
 );
 
--- we'll use mainly GetActorEventsRaw with filters
--- a filter has this structure
--- [
---   {
---     "fields": {
---       "abc": [
---         {
---           "codec": 81,
---           "value": "ZGRhdGE="
---         }
---       ]
---     },
---     "fromHeight": 1010,
---     "toHeight": 1020
---   }
--- ]
--- need to lookup how we did it for fidl. most likely we need to encode all the sector event types for the filter
--- does this api has the same limitations as the lotus api? meaning 1000 / 10000 events per response and no way of paginating them
+-- we'll have an endpoint that returns all events for a given height
+-- we'll filter the resulting json in code using the same values we would of used for filters
+-- need to lookup how I did the encoding for fidl. most likely we need to encode all the sector event types for the filter
 
 CREATE TABLE public.miner_sector_events (
     height     bigint                         NOT NULL,
-    miner_id   text                           NOT NULL,
+    miner_id   integer                        NOT NULL,
     sector_id  bigint                         NOT NULL,
-    state_root text                           NOT NULL,
+    state_root bytea                          NOT NULL,
     event      public.miner_sector_event_type NOT NULL
 );
-ALTER TABLE ONLY public.miner_sector_events ADD CONSTRAINT miner_sector_events_pkey PRIMARY KEY (height, sector_id, event, miner_id, state_root);
-CREATE INDEX miner_sector_events_height_idx ON public.miner_sector_events USING btree (height DESC);
-SELECT create_hypertable('miner_sector_events', 'height', chunk_time_interval => 20160, if_not_exists => TRUE);
-SELECT set_integer_now_func('miner_sector_events', 'current_height', replace_if_exists => true);
 
 -- this can be populated at the same time as derived_gas_outputs
 -- curently only for ProveCommitAggregate method seems to need decoded params for the panels, so we'll start only with that
+-- decoding will be done via an endpoint similar to StateDecodeParams
 CREATE TABLE public.decoded_params (
-    msg_internal_id bigint,
+    height bigint,
+    index_in_block int,
     params jsonb
+    FOREIGN KEY (height, index_in_block) REFERENCES derived_gas_outputs (height, index_in_block)
 );
 
--- tabel meant to track if a state root is canonical or not
--- can be populated using ChainNotify
--- alternative process only tipsets older that 30 epochs
-CREATE TABLE public.chain_state (
-    height      bigint NOT NULL,
-    tipset_key  text   NOT NULL,   
-    parent_key  text   NOT NULL,
-    state_root  text   NOT NULL,
-    canonical   boolean NOT NULL DEFAULT true,
-    reverted_at timestamptz
-);
+
+-- in order to keep the data in sync with the chain we'll have a cron job that runs every 30s
+-- and calls ChainGetHead. I will compare the cids/height with the data in block headers and 
+-- on mismatch it will delete all data for that height in tables: block_headers, chain_economics, derived_gas_output, miner_sector_events
+-- data in decoded params will get deleted because it references derived_gas_outputs through the foreign key
+-- on mismatch it will continue and compare the previous height, and repeat this process until what's in the db matches the api call
