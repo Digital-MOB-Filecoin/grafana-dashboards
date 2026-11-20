@@ -145,7 +145,7 @@ CREATE TABLE public.decoded_params (
 
 
 -- in order to keep the data in sync with the chain we'll have a cron job that runs every 30s
--- and calls ChainGetHead. I will compare the cids/height with the data in block headers and 
+-- and calls ChainGetHead. It will compare the cids/height with the data in block headers and 
 -- on mismatch it will delete all data for that height in tables: block_headers, chain_economics, derived_gas_output, miner_sector_events
 -- data in decoded params will get deleted because it references derived_gas_outputs through the foreign key
 -- on mismatch it will continue and compare the previous height, and repeat this process until what's in the db matches the api call

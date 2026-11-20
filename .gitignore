@@ -1,0 +1,16 @@
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Go build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
